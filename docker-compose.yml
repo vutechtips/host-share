@@ -5,7 +5,7 @@ services:
     container_name: file-share-app
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "80:8000"
     volumes:
       # Ánh xạ thư mục lưu trữ file ra ngoài host để tránh mất file khi cập nhật container
       - ./storage:/app/storage
