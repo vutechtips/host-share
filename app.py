@@ -1191,102 +1191,103 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
   }
 
   async function handleDroppedItems(items) {
-    const files = [];
-    const queue = [];
+    // Thu thập [file, relativePath] từ các entry kéo thả
+    const pairs = [];
+
+    async function traverseEntry(entry, pathPrefix) {
+      if (entry.isFile) {
+        const file = await new Promise((resolve) => entry.file(resolve));
+        pairs.push([file, pathPrefix + entry.name]);
+      } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        // readEntries chỉ trả tối đa 100 entries mỗi lần, cần loop
+        const allEntries = [];
+        const readBatch = () => new Promise((resolve) => dirReader.readEntries(resolve));
+        let batch;
+        do {
+          batch = await readBatch();
+          allEntries.push(...batch);
+        } while (batch.length > 0);
+        for (const child of allEntries) {
+          await traverseEntry(child, pathPrefix + entry.name + '/');
+        }
+      }
+    }
+
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind === 'file') {
         const entry = item.webkitGetAsEntry();
-        if (entry) {
-          queue.push(traverseFileTree(entry, ''));
-        }
+        if (entry) await traverseEntry(entry, '');
       }
     }
-    await Promise.all(queue);
-
-    async function traverseFileTree(entry, path) {
-      if (entry.isFile) {
-        const file = await new Promise((resolve) => entry.file(resolve));
-        Object.defineProperty(file, 'webkitRelativePath', {
-          value: path + entry.name,
-          writable: true
-        });
-        files.push(file);
-      } else if (entry.isDirectory) {
-        const dirReader = entry.createReader();
-        const readAllEntries = async () => {
-          let allEntries = [];
-          let read = async () => {
-            let results = await new Promise((resolve) => dirReader.readEntries(resolve));
-            if (results.length > 0) {
-              allEntries = allEntries.concat(results);
-              await read();
-            }
-          };
-          await read();
-          return allEntries;
-        };
-        const entries = await readAllEntries();
-        const promises = [];
-        for (let i = 0; i < entries.length; i++) {
-          promises.push(traverseFileTree(entries[i], path + entry.name + '/'));
-        }
-        await Promise.all(promises);
-      }
-    }
-
-    uploadFiles(files);
+    uploadPairs(pairs);
   }
 
-  function uploadFiles(files) {
+  // uploadFiles: dành cho file picker thông thường (File có sẵn webkitRelativePath)
+  function uploadFiles(fileList) {
     if (!currentUserId) return toast("Chưa có user ID", true);
-    if (!files || files.length === 0) return;
-    const fileList = Array.from(files);
+    if (!fileList || fileList.length === 0) return;
+    const pairs = Array.from(fileList).map(f => [f, f.webkitRelativePath || f.name]);
+    uploadPairs(pairs);
+  }
+
+  // uploadPairs: nhân hàm upload dùng chung, nhận mảng [File, relativePath]
+  function uploadPairs(pairs) {
+    if (!currentUserId) return toast("Chưa có user ID", true);
+    if (!pairs || pairs.length === 0) return;
+    const queue = [...pairs];
+
     const uploadNext = () => {
-      const file = fileList.shift();
-      if (!file) {
+      if (queue.length === 0) {
         progressBar.style.width = "0%";
         return;
       }
+      const [file, relativePath] = queue.shift();
+
       if (file.size > MAX_SIZE) {
-        toast(`${file.name} vượt 500MB`, true);
+        toast(`${relativePath} vượt 500MB`, true);
         uploadNext();
         return;
       }
+
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${apiBase}/upload/${currentUserId}`);
+
+      // Truyền đường dẫn tương đối qua header riêng
+      // (FastAPI/Starlette cắt mất phần thư mục trong file.filename khi parse multipart)
+      xhr.setRequestHeader("X-File-Path", relativePath);
+
       const form = new FormData();
-      // Gửi webkitRelativePath để giữ nguyên cấu trúc thư mục
-      form.append("file", file, file.webkitRelativePath || file.name);
+      form.append("file", file, file.name); // chỉ truyền tên file, path đi qua header
+
       xhr.upload.onprogress = (evt) => {
         if (evt.lengthComputable) {
-          const percent = Math.min(100, (evt.loaded / evt.total) * 100);
-          progressBar.style.width = percent + "%";
+          progressBar.style.width = Math.min(100, (evt.loaded / evt.total) * 100) + "%";
         }
       };
       xhr.onload = () => {
         progressBar.style.width = "0%";
         if (xhr.status >= 200 && xhr.status < 300) {
-          const dispName = file.webkitRelativePath || file.name;
-          toast(`Đã upload: ${dispName}`);
+          toast(`Đã upload: ${relativePath}`);
           listFiles();
           uploadNext();
         } else {
-          toast(xhr.responseText || "Upload lỗi", true);
+          let msg = "Upload lỗi";
+          try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (_) {}
+          toast(msg, true);
         }
       };
       xhr.onerror = () => {
         progressBar.style.width = "0%";
         toast("Kết nối lỗi", true);
       };
-      // Gửi đường dẫn tương đối qua header để backend giữ nguyên cấu trúc thư mục
-      if (file.webkitRelativePath) {
-        xhr.setRequestHeader("X-File-Path", file.webkitRelativePath);
-      }
       xhr.send(form);
     };
+
     uploadNext();
   }
+
 
   function downloadFile(name) {
     if (!currentUserId) return;
@@ -1333,6 +1334,10 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     }
   });
   fileInput.addEventListener("change", (e) => uploadFiles(e.target.files));
+  const folderInput = document.getElementById("folder-input");
+  if (folderInput) {
+    folderInput.addEventListener("change", (e) => uploadFiles(e.target.files));
+  }
 
   (async () => {
     if (setUserBtn) setUserBtn.addEventListener("click", applyUserInput);
