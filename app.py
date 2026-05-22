@@ -1036,10 +1036,10 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         </div>
         <div class="code-row">
           <div class="code-box">
-            <span class="code-label">Tải toàn bộ (ZIP)</span>
-            <code id="curl-zip">curl -OJ &lt;origin&gt;/api/download-zip/&lt;user_id&gt;</code>
+            <span class="code-label">Tải toàn bộ (giữ cây thư mục) &mdash; Python 3</span>
+            <code id="curl-all">python3 -c "import json,os,urllib.request as r; U='&lt;user_id&gt;'; B='&lt;origin&gt;'; [(__import__('os').makedirs(os.path.dirname(f['name']) or '.', exist_ok=True), r.urlretrieve(f['url'], f['name']), print('OK', f['name'])) for f in json.loads(r.urlopen(f'{B}/api/files/{U}').read())['files']]"</code>
           </div>
-          <button class="secondary small" onclick="copySnippet('curl-zip')">Copy</button>
+          <button class="secondary small" onclick="copySnippet('curl-all')">Copy</button>
         </div>
       </div>
     </div>
@@ -1348,11 +1348,19 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const uploadEl = document.getElementById("curl-upload");
     const listEl = document.getElementById("curl-list");
     const dlEl = document.getElementById("curl-download");
-    const zipEl = document.getElementById("curl-zip");
-    if (uploadEl) uploadEl.textContent = `curl -X POST -F \"file=@/path/to/file\" ${origin}/api/upload/newuser=${aliasSample}`;
-    if (listEl) listEl.textContent = `curl ${origin}/api/files/${user}`;
-    if (dlEl) dlEl.textContent = `curl -O ${origin}/api/download/${user}/<filename>`;
-    if (zipEl) zipEl.textContent = `curl -OJ ${origin}/api/download-zip/${user}`;
+    const allEl = document.getElementById("curl-all");
+    if (uploadEl) uploadEl.textContent = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
+    if (listEl) listEl.textContent = 'curl ' + origin + '/api/files/' + user;
+    if (dlEl) dlEl.textContent = 'curl -O ' + origin + '/api/download/' + user + '/<filename>';
+    if (allEl) {
+      // Python one-liner: list files then download each to its relative path
+      allEl.textContent =
+        "python3 -c \"import json,os,urllib.request as r; " +
+        "U='" + user + "'; B='" + origin + "'; " +
+        "[(__import__('os').makedirs(os.path.dirname(f['name']) or '.', exist_ok=True), " +
+        "r.urlretrieve(f['url'], f['name']), print('OK', f['name'])) " +
+        "for f in json.loads(r.urlopen(B+'/api/files/'+U).read())['files']]\"";
+    }
   }
 
   uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag"); });
