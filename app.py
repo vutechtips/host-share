@@ -73,9 +73,17 @@ def safe_filename(filename: str) -> str:
 
 def resolve_file_path(user_id: str, filename: str, *, create_user_dir: bool = False) -> Path:
     user_dir = get_user_dir(user_id, create=create_user_dir)
-    path = (user_dir / safe_filename(filename)).resolve()
-    if user_dir not in path.parents:
+    # Clean and normalize the filename path, rejecting any path traversal
+    filename = (filename or "").strip().replace("\\", "/")
+    parts = [p for p in filename.split("/") if p and p not in {".", ".."}]
+    if not parts:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    
+    path = (user_dir / "/".join(parts)).resolve()
+    if user_dir not in path.parents and user_dir != path:
         raise HTTPException(status_code=400, detail="Invalid path")
+    if create_user_dir:
+        path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -112,7 +120,8 @@ def cleanup_old_files(now: datetime | None = None) -> List[str]:
     for user_dir in STORAGE_ROOT.iterdir():
         if not user_dir.is_dir():
             continue
-        for file_path in user_dir.iterdir():
+        # Use rglob to scan recursively
+        for file_path in list(user_dir.rglob("*")):
             if not file_path.is_file():
                 continue
             try:
@@ -123,6 +132,13 @@ def cleanup_old_files(now: datetime | None = None) -> List[str]:
                 try:
                     file_path.unlink()
                     removed.append(str(file_path))
+                except OSError:
+                    continue
+        # Clean up empty subdirectories recursively
+        for sub_dir in sorted(list(user_dir.rglob("*")), key=lambda p: len(str(p)), reverse=True):
+            if sub_dir.is_dir():
+                try:
+                    sub_dir.rmdir()
                 except OSError:
                     continue
     return removed
@@ -200,7 +216,7 @@ async def upload_file(user_id: str, request: Request, file: UploadFile = File(..
     return JSONResponse({"filename": dest_path.name, "size": size})
 
 
-@app.get("/api/download/{user_id}/{filename}")
+@app.get("/api/download/{user_id}/{filename:path}")
 async def download_file(user_id: str, filename: str) -> FileResponse:
     user_id, _ = normalize_user_ref(user_id)
     path = resolve_file_path(user_id, filename)
@@ -216,19 +232,21 @@ async def list_files(user_id: str, request: Request, pretty: bool = True) -> Res
     if not user_dir.exists():
         return maybe_pretty_json({"files": []}, pretty)
     files = []
-    for file_path in user_dir.iterdir():
+    # Use rglob to scan recursively
+    for file_path in user_dir.rglob("*"):
         if not file_path.is_file():
             continue
+        rel_name = str(file_path.relative_to(user_dir)).replace("\\", "/")
         url = str(
             request.url_for(
                 "download_file",
                 user_id=user_id,
-                filename=file_path.name,
+                filename=rel_name,
             )
         )
         files.append(
             {
-                "name": file_path.name,
+                "name": rel_name,
                 "url": url,
             }
         )
@@ -237,7 +255,7 @@ async def list_files(user_id: str, request: Request, pretty: bool = True) -> Res
     return maybe_pretty_json(data, pretty)
 
 
-@app.delete("/api/delete/{user_id}/{filename}")
+@app.delete("/api/delete/{user_id}/{filename:path}")
 async def delete_file(user_id: str, filename: str) -> JSONResponse:
     user_id, _ = normalize_user_ref(user_id)
     path = resolve_file_path(user_id, filename)
@@ -245,25 +263,38 @@ async def delete_file(user_id: str, filename: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="File not found")
     try:
         path.unlink()
+        # Clean up empty parent directories up to user_dir
+        user_dir = get_user_dir(user_id)
+        parent = path.parent
+        while parent != user_dir and parent.exists():
+            if not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+            else:
+                break
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Unable to delete file") from exc
-    return JSONResponse({"deleted": path.name})
+    return JSONResponse({"deleted": filename})
 
 
 @app.delete("/api/clear/{user_id}")
 async def clear_files(user_id: str) -> JSONResponse:
+    import shutil
     user_id, _ = normalize_user_ref(user_id)
     user_dir = get_user_dir(user_id)
     if not user_dir.exists():
         return JSONResponse({"deleted": 0})
     deleted = 0
-    for file_path in user_dir.iterdir():
-        if file_path.is_file():
-            try:
-                file_path.unlink()
+    for item in list(user_dir.iterdir()):
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
                 deleted += 1
-            except OSError:
-                continue
+            else:
+                item.unlink()
+                deleted += 1
+        except OSError:
+            continue
     return JSONResponse({"deleted": deleted})
 
 
@@ -941,8 +972,13 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
       <div class="card">
         <div class="label">Upload</div>
         <div class="upload" id="upload-zone">
-          <p class="muted small">Kéo thả hoặc chọn file để upload (tối đa 500MB).</p>
-          <input id="file-input" type="file" multiple style="margin-top: 12px;" />
+          <p class="muted small">Kéo thả file/thư mục hoặc chọn bên dưới (tối đa 500MB).</p>
+          <div style="display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap;">
+            <button class="secondary small" onclick="document.getElementById('file-input').click()">Chọn file</button>
+            <button class="secondary small" onclick="document.getElementById('folder-input').click()">Chọn thư mục</button>
+          </div>
+          <input id="file-input" type="file" multiple style="display: none;" />
+          <input id="folder-input" type="file" webkitdirectory directory multiple style="display: none;" />
           <div class="progress" aria-label="upload-progress">
             <div id="progress-bar"></div>
           </div>
@@ -1060,11 +1096,11 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
       const files = data.files || [];
       filesBody.innerHTML = "";
       fileCards.innerHTML = "";
-        // reset inline display so CSS (desktop vs mobile) can control visibility
-        filesTable.style.removeProperty("display");
-        fileCards.style.removeProperty("display");
+      // reset inline display so CSS (desktop vs mobile) can control visibility
+      filesTable.style.removeProperty("display");
+      fileCards.style.removeProperty("display");
 
-        if (files.length === 0) {
+      if (files.length === 0) {
         filesTable.hidden = true;
         fileCards.hidden = true;
         filesEmptyEl.style.display = "block";
@@ -1073,30 +1109,60 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
       filesEmptyEl.style.display = "none";
       filesTable.hidden = false;
       fileCards.hidden = false;
+
       for (const f of files) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${f.name}</td>
-          <td class="actions">
-              <button class="secondary small" onclick="downloadFile('${f.name}')">Tải</button>
-              <button class="secondary small" onclick="deleteFile('${f.name}')">Xóa</button>
-            </td>`;
-          filesBody.appendChild(tr);
 
-          const card = document.createElement("div");
-          card.className = "file-card";
-          card.innerHTML = `
-            <div>
-              <div>${f.name}</div>
-            </div>
-            <div class="actions">
-              <button class="secondary small" onclick="downloadFile('${f.name}')">Tải</button>
-              <button class="secondary small" onclick="deleteFile('${f.name}')">Xóa</button>
-            </div>`;
-          fileCards.appendChild(card);
-        }
-      } catch (err) {
-        toast("Khong tai duoc danh sach file", true);
+        const tdName = document.createElement("td");
+        tdName.textContent = f.name;
+        tr.appendChild(tdName);
+
+        const tdActions = document.createElement("td");
+        tdActions.className = "actions";
+
+        const btnDownload = document.createElement("button");
+        btnDownload.className = "secondary small";
+        btnDownload.textContent = "Tải";
+        btnDownload.addEventListener("click", () => downloadFile(f.name));
+
+        const btnDelete = document.createElement("button");
+        btnDelete.className = "secondary small";
+        btnDelete.textContent = "Xóa";
+        btnDelete.addEventListener("click", () => deleteFile(f.name));
+
+        tdActions.appendChild(btnDownload);
+        tdActions.appendChild(btnDelete);
+        tr.appendChild(tdActions);
+        filesBody.appendChild(tr);
+
+        // Mobile card view
+        const card = document.createElement("div");
+        card.className = "file-card";
+        
+        const cardTitle = document.createElement("div");
+        cardTitle.textContent = f.name;
+        card.appendChild(cardTitle);
+
+        const cardActions = document.createElement("div");
+        cardActions.className = "actions";
+
+        const btnCardDownload = document.createElement("button");
+        btnCardDownload.className = "secondary small";
+        btnCardDownload.textContent = "Tải";
+        btnCardDownload.addEventListener("click", () => downloadFile(f.name));
+
+        const btnCardDelete = document.createElement("button");
+        btnCardDelete.className = "secondary small";
+        btnCardDelete.textContent = "Xóa";
+        btnCardDelete.addEventListener("click", () => deleteFile(f.name));
+
+        cardActions.appendChild(btnCardDownload);
+        cardActions.appendChild(btnCardDelete);
+        card.appendChild(cardActions);
+        fileCards.appendChild(card);
+      }
+    } catch (err) {
+      toast("Không tải được danh sách file", true);
     }
   }
 
@@ -1121,67 +1187,119 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     }
   }
 
-  function uploadFiles(files) {
-    if (!currentUserId) return toast("Chua co user ID", true);
-      if (!files || files.length === 0) return;
-      const fileList = Array.from(files);
-      const uploadNext = () => {
-        const file = fileList.shift();
-        if (!file) {
-          progressBar.style.width = "0%";
-          return;
+  async function handleDroppedItems(items) {
+    const files = [];
+    const queue = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file') {
+        const entry = item.webkitGetAsEntry();
+        if (entry) {
+          queue.push(traverseFileTree(entry, ''));
         }
-        if (file.size > MAX_SIZE) {
-          toast(`${file.name} vuot 500MB`, true);
-          uploadNext();
-          return;
-        }
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", `${apiBase}/upload/${currentUserId}`);
-        const form = new FormData();
-        form.append("file", file);
-        xhr.upload.onprogress = (evt) => {
-          if (evt.lengthComputable) {
-            const percent = Math.min(100, (evt.loaded / evt.total) * 100);
-            progressBar.style.width = percent + "%";
-          }
-        };
-        xhr.onload = () => {
-          progressBar.style.width = "0%";
-          if (xhr.status >= 200 && xhr.status < 300) {
-            toast(`Da upload: ${file.name}`);
-            listFiles();
-            uploadNext();
-          } else {
-            toast(xhr.responseText || "Upload loi", true);
-          }
-        };
-        xhr.onerror = () => {
-          progressBar.style.width = "0%";
-          toast("Ket noi loi", true);
-        };
-        xhr.send(form);
-      };
-      uploadNext();
-    }
-
-    function downloadFile(name) {
-      if (!currentUserId) return;
-      window.location.href = `${apiBase}/download/${currentUserId}/${encodeURIComponent(name)}`;
-    }
-
-    async function deleteFile(name) {
-      if (!currentUserId) return;
-      const ok = confirm(`Xóa file "${name}"?`);
-      if (!ok) return;
-      try {
-        const res = await fetch(`${apiBase}/delete/${currentUserId}/${encodeURIComponent(name)}`, { method: "DELETE" });
-        if (!res.ok) throw new Error("Xóa thất bại");
-        toast(`Đã xóa: ${name}`);
-        listFiles();
-      } catch (err) {
-        toast(err.message, true);
       }
+    }
+    await Promise.all(queue);
+
+    async function traverseFileTree(entry, path) {
+      if (entry.isFile) {
+        const file = await new Promise((resolve) => entry.file(resolve));
+        Object.defineProperty(file, 'webkitRelativePath', {
+          value: path + entry.name,
+          writable: true
+        });
+        files.push(file);
+      } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        const readAllEntries = async () => {
+          let allEntries = [];
+          let read = async () => {
+            let results = await new Promise((resolve) => dirReader.readEntries(resolve));
+            if (results.length > 0) {
+              allEntries = allEntries.concat(results);
+              await read();
+            }
+          };
+          await read();
+          return allEntries;
+        };
+        const entries = await readAllEntries();
+        const promises = [];
+        for (let i = 0; i < entries.length; i++) {
+          promises.push(traverseFileTree(entries[i], path + entry.name + '/'));
+        }
+        await Promise.all(promises);
+      }
+    }
+
+    uploadFiles(files);
+  }
+
+  function uploadFiles(files) {
+    if (!currentUserId) return toast("Chưa có user ID", true);
+    if (!files || files.length === 0) return;
+    const fileList = Array.from(files);
+    const uploadNext = () => {
+      const file = fileList.shift();
+      if (!file) {
+        progressBar.style.width = "0%";
+        return;
+      }
+      if (file.size > MAX_SIZE) {
+        toast(`${file.name} vượt 500MB`, true);
+        uploadNext();
+        return;
+      }
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${apiBase}/upload/${currentUserId}`);
+      const form = new FormData();
+      // Gửi webkitRelativePath để giữ nguyên cấu trúc thư mục
+      form.append("file", file, file.webkitRelativePath || file.name);
+      xhr.upload.onprogress = (evt) => {
+        if (evt.lengthComputable) {
+          const percent = Math.min(100, (evt.loaded / evt.total) * 100);
+          progressBar.style.width = percent + "%";
+        }
+      };
+      xhr.onload = () => {
+        progressBar.style.width = "0%";
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const dispName = file.webkitRelativePath || file.name;
+          toast(`Đã upload: ${dispName}`);
+          listFiles();
+          uploadNext();
+        } else {
+          toast(xhr.responseText || "Upload lỗi", true);
+        }
+      };
+      xhr.onerror = () => {
+        progressBar.style.width = "0%";
+        toast("Kết nối lỗi", true);
+      };
+      xhr.send(form);
+    };
+    uploadNext();
+  }
+
+  function downloadFile(name) {
+    if (!currentUserId) return;
+    const safePath = name.split('/').map(encodeURIComponent).join('/');
+    window.location.href = `${apiBase}/download/${currentUserId}/${safePath}`;
+  }
+
+  async function deleteFile(name) {
+    if (!currentUserId) return;
+    const ok = confirm(`Xóa file "${name}"?`);
+    if (!ok) return;
+    try {
+      const safePath = name.split('/').map(encodeURIComponent).join('/');
+      const res = await fetch(`${apiBase}/delete/${currentUserId}/${safePath}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Xóa thất bại");
+      toast(`Đã xóa: ${name}`);
+      listFiles();
+    } catch (err) {
+      toast(err.message, true);
+    }
   }
 
   function updateCliSnippets() {
@@ -1197,13 +1315,17 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
   }
 
   uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag"); });
-    uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag"));
-    uploadZone.addEventListener("drop", (e) => {
-      e.preventDefault();
-      uploadZone.classList.remove("drag");
+  uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag"));
+  uploadZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    uploadZone.classList.remove("drag");
+    if (e.dataTransfer.items) {
+      handleDroppedItems(e.dataTransfer.items);
+    } else {
       uploadFiles(e.dataTransfer.files);
-    });
-    fileInput.addEventListener("change", (e) => uploadFiles(e.target.files));
+    }
+  });
+  fileInput.addEventListener("change", (e) => uploadFiles(e.target.files));
 
   (async () => {
     if (setUserBtn) setUserBtn.addEventListener("click", applyUserInput);
