@@ -195,7 +195,10 @@ async def upload_file(user_id: str, request: Request, file: UploadFile = File(..
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid content-length")
 
-    dest_path = resolve_file_path(user_id, file.filename, create_user_dir=True)
+    # Ưu tiên đọc đường dẫn tương đối từ header X-File-Path (để giữ cấu trúc thư mục)
+    # Starlette/FastAPI hay cắt mất phần thư mục trong file.filename khi parse multipart
+    relative_path = request.headers.get("x-file-path") or file.filename or ""
+    dest_path = resolve_file_path(user_id, relative_path, create_user_dir=True)
     size = 0
     try:
         with dest_path.open("wb") as buffer:
@@ -1276,6 +1279,10 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         progressBar.style.width = "0%";
         toast("Kết nối lỗi", true);
       };
+      // Gửi đường dẫn tương đối qua header để backend giữ nguyên cấu trúc thư mục
+      if (file.webkitRelativePath) {
+        xhr.setRequestHeader("X-File-Path", file.webkitRelativePath);
+      }
       xhr.send(form);
     };
     uploadNext();
