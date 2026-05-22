@@ -185,7 +185,8 @@ async def create_user() -> JSONResponse:
 
 
 @app.post("/api/upload/{user_id}")
-async def upload_file(user_id: str, request: Request, file: UploadFile = File(...)) -> JSONResponse:
+@app.post("/up/{user_id}")
+async def upload_file(user_id: str, request: Request, file: Optional[UploadFile] = File(None), f: Optional[UploadFile] = File(None)) -> JSONResponse:
     user_id, _ = normalize_user_ref(user_id)
     content_length = request.headers.get("content-length")
     if content_length:
@@ -195,17 +196,51 @@ async def upload_file(user_id: str, request: Request, file: UploadFile = File(..
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid content-length")
 
+    uploaded_file = file or f
+    if not uploaded_file:
+        raise HTTPException(status_code=400, detail="Missing file parameter (use 'file' or 'f')")
+
     # Ưu tiên đọc đường dẫn tương đối từ header X-File-Path (để giữ cấu trúc thư mục)
     # Starlette/FastAPI hay cắt mất phần thư mục trong file.filename khi parse multipart
-    relative_path = request.headers.get("x-file-path") or file.filename or ""
+    relative_path = request.headers.get("x-file-path") or uploaded_file.filename or ""
     dest_path = resolve_file_path(user_id, relative_path, create_user_dir=True)
     size = 0
     try:
         with dest_path.open("wb") as buffer:
             while True:
-                chunk = await file.read(1024 * 1024)
+                chunk = await uploaded_file.read(1024 * 1024)
                 if not chunk:
                     break
+                size += len(chunk)
+                if size > MAX_FILE_SIZE:
+                    dest_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="File too large")
+                buffer.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Failed to save file") from exc
+    return JSONResponse({"filename": dest_path.name, "size": size})
+
+
+@app.put("/up/{user_id}/{filename:path}")
+@app.post("/up/{user_id}/{filename:path}")
+async def upload_file_binary(user_id: str, filename: str, request: Request) -> JSONResponse:
+    user_id, _ = normalize_user_ref(user_id)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail="File too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid content-length")
+
+    dest_path = resolve_file_path(user_id, filename, create_user_dir=True)
+    size = 0
+    try:
+        with dest_path.open("wb") as buffer:
+            async for chunk in request.stream():
                 size += len(chunk)
                 if size > MAX_FILE_SIZE:
                     dest_path.unlink(missing_ok=True)
@@ -447,7 +482,7 @@ async def get_path_root(user_id: str, path: str) -> Response:
     Chỉ dùng cho tải file hoặc nén thư mục trực tiếp.
     Được đặt ở cuối cùng để không đè lên các route /api/ hay /dl/
     """
-    if user_id in ("api", "dl", "get", "favicon.ico"):
+    if user_id in ("api", "dl", "get", "up", "favicon.ico"):
         raise HTTPException(status_code=404, detail="Not found")
 
     user_id, _ = normalize_user_ref(user_id)
@@ -1181,10 +1216,17 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         </div>
         <div class="code-row">
           <div class="code-box">
-            <span class="code-label">Upload file/th\u01b0 m\u1ee5c</span>
-            <code id="curl-upload">curl -X POST -F "file=@/path/to/file" &lt;origin&gt;/api/upload/newuser=your_alias</code>
+            <span class="code-label">Upload file (D\u00f9ng form - si\u00eau ng\u1eafn)</span>
+            <code id="curl-upload">curl -F f=@file.txt &lt;origin&gt;/up/&lt;user_id&gt;</code>
           </div>
           <button class="secondary small" onclick="copySnippet('curl-upload')">Copy</button>
+        </div>
+        <div class="code-row">
+          <div class="code-box">
+            <span class="code-label">Upload file (D\u00f9ng binary PUT - gi\u1eef t\u00ean file)</span>
+            <code id="curl-upload-put">curl -T file.txt &lt;origin&gt;/up/&lt;user_id&gt;/</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('curl-upload-put')">Copy</button>
         </div>
       </div>
     </div>
@@ -1492,12 +1534,14 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const user = currentUserId || "<user_id>";
 
     const uploadEl  = document.getElementById("curl-upload");
+    const uploadPutEl = document.getElementById("curl-upload-put");
     const dlPsEl    = document.getElementById("dl-ps");
     const dlShEl    = document.getElementById("dl-sh");
     const dlPsAllEl = document.getElementById("dl-ps-all");
     const getFileEl = document.getElementById("get-file");
 
-    if (uploadEl)  uploadEl.textContent  = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
+    if (uploadEl)  uploadEl.textContent  = 'curl -F f=@file.txt ' + origin + '/up/' + aliasSample;
+    if (uploadPutEl) uploadPutEl.textContent = 'curl -T file.txt ' + origin + '/up/' + aliasSample + '/';
     if (dlPsEl)    dlPsEl.textContent    = 'curl -s ' + origin + '/dl/ps/' + user + '/<folder> | powershell -';
     if (dlShEl)    dlShEl.textContent    = 'curl -s ' + origin + '/dl/sh/' + user + '/<folder> | bash';
     if (dlPsAllEl) dlPsAllEl.textContent = 'curl -s ' + origin + '/dl/ps/' + user + ' | powershell -';
