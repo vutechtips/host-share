@@ -325,6 +325,56 @@ async def download_zip(user_id: str) -> Response:
         headers={"Content-Disposition": f'attachment; filename="files-{user_id[:8]}.zip"'},
     )
 
+
+def _zip_dir(target_dir: Path, zip_name: str) -> Response:
+    """Nén toàn bộ nội dung target_dir thành ZIP trả về trực tiếp."""
+    import io, zipfile as zf
+    files = [p for p in target_dir.rglob("*") if p.is_file()]
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found")
+    buf = io.BytesIO()
+    with zf.ZipFile(buf, mode="w", compression=zf.ZIP_DEFLATED) as z:
+        for fp in files:
+            arcname = str(fp.relative_to(target_dir)).replace("\\", "/")
+            z.write(fp, arcname)
+    buf.seek(0)
+    return Response(
+        content=buf.read(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}.zip"'},
+    )
+
+
+@app.get("/get/{user_id}")
+async def get_all(user_id: str) -> Response:
+    """Tải toàn bộ file của user dưới dạng ZIP."""
+    user_id, alias = normalize_user_ref(user_id)
+    user_dir = get_user_dir(user_id)
+    if not user_dir.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return _zip_dir(user_dir, alias or user_id[:8])
+
+
+@app.get("/get/{user_id}/{path:path}")
+async def get_path(user_id: str, path: str) -> Response:
+    """
+    Shorthand download:
+      - Nếu path là file  → tải thẳng file đó
+      - Nếu path là thư mục → nén thành ZIP và tải về
+    """
+    user_id, _ = normalize_user_ref(user_id)
+    target = resolve_file_path(user_id, path)
+
+    if target.is_file():
+        return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+    if target.is_dir():
+        folder_name = target.name
+        return _zip_dir(target, folder_name)
+
+    raise HTTPException(status_code=404, detail="Not found")
+
+
 FRONTEND_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1012,34 +1062,34 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         </div>
       </div>
       <div class="card">
-        <div class="label">CLI</div>
+        <div class="label">CLI &mdash; Download</div>
         <div class="code-row">
           <div class="code-box">
-             <span class="code-label">Upload (tạo user theo alias)</span>
+            <span class="code-label">T\u1ea3i to\u00e0n b\u1ed9 (ZIP)</span>
+            <code id="get-all">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('get-all')">Copy</button>
+        </div>
+        <div class="code-row">
+          <div class="code-box">
+            <span class="code-label">T\u1ea3i th\u01b0 m\u1ee5c (ZIP)</span>
+            <code id="get-folder">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;/&lt;folder&gt;</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('get-folder')">Copy</button>
+        </div>
+        <div class="code-row">
+          <div class="code-box">
+            <span class="code-label">T\u1ea3i 1 file</span>
+            <code id="get-file">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;/&lt;folder&gt;/&lt;file&gt;</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('get-file')">Copy</button>
+        </div>
+        <div class="code-row">
+          <div class="code-box">
+            <span class="code-label">Upload file/th\u01b0 m\u1ee5c</span>
             <code id="curl-upload">curl -X POST -F "file=@/path/to/file" &lt;origin&gt;/api/upload/newuser=your_alias</code>
           </div>
           <button class="secondary small" onclick="copySnippet('curl-upload')">Copy</button>
-        </div>
-        <div class="code-row">
-          <div class="code-box">
-             <span class="code-label">Liệt kê file</span>
-            <code id="curl-list">curl &lt;origin&gt;/api/files/&lt;user_id&gt;</code>
-          </div>
-          <button class="secondary small" onclick="copySnippet('curl-list')">Copy</button>
-        </div>
-        <div class="code-row">
-          <div class="code-box">
-            <span class="code-label">Tải file</span>
-            <code id="curl-download">curl -O &lt;origin&gt;/api/download/&lt;user_id&gt;/&lt;filename&gt;</code>
-          </div>
-          <button class="secondary small" onclick="copySnippet('curl-download')">Copy</button>
-        </div>
-        <div class="code-row">
-          <div class="code-box">
-            <span class="code-label">Tải toàn bộ (giữ cây thư mục) &mdash; Python 3</span>
-            <code id="curl-all">python3 -c "import json,os,urllib.request as r; U='&lt;user_id&gt;'; B='&lt;origin&gt;'; [(__import__('os').makedirs(os.path.dirname(f['name']) or '.', exist_ok=True), r.urlretrieve(f['url'], f['name']), print('OK', f['name'])) for f in json.loads(r.urlopen(f'{B}/api/files/{U}').read())['files']]"</code>
-          </div>
-          <button class="secondary small" onclick="copySnippet('curl-all')">Copy</button>
         </div>
       </div>
     </div>
@@ -1345,23 +1395,18 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const origin = window.location.origin;
     const aliasSample = currentUserId || "your_alias";
     const user = currentUserId || "<user_id>";
-    const uploadEl = document.getElementById("curl-upload");
-    const listEl = document.getElementById("curl-list");
-    const dlEl = document.getElementById("curl-download");
-    const allEl = document.getElementById("curl-all");
-    if (uploadEl) uploadEl.textContent = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
-    if (listEl) listEl.textContent = 'curl ' + origin + '/api/files/' + user;
-    if (dlEl) dlEl.textContent = 'curl -O ' + origin + '/api/download/' + user + '/<filename>';
-    if (allEl) {
-      // Python one-liner: list files then download each to its relative path
-      allEl.textContent =
-        "python3 -c \"import json,os,urllib.request as r; " +
-        "U='" + user + "'; B='" + origin + "'; " +
-        "[(__import__('os').makedirs(os.path.dirname(f['name']) or '.', exist_ok=True), " +
-        "r.urlretrieve(f['url'], f['name']), print('OK', f['name'])) " +
-        "for f in json.loads(r.urlopen(B+'/api/files/'+U).read())['files']]\"";
-    }
+
+    const uploadEl   = document.getElementById("curl-upload");
+    const getAllEl   = document.getElementById("get-all");
+    const getFolderEl = document.getElementById("get-folder");
+    const getFileEl  = document.getElementById("get-file");
+
+    if (uploadEl)    uploadEl.textContent    = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
+    if (getAllEl)    getAllEl.textContent    = 'curl -OJ ' + origin + '/get/' + user;
+    if (getFolderEl) getFolderEl.textContent = 'curl -OJ ' + origin + '/get/' + user + '/<folder>';
+    if (getFileEl)  getFileEl.textContent   = 'curl -OJ ' + origin + '/get/' + user + '/<folder>/<file>';
   }
+
 
   uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag"); });
   uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag"));
