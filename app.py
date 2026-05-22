@@ -440,6 +440,29 @@ async def dl_powershell(user_id: str, request: Request, path: str = "") -> Respo
     return Response(content="\r\n".join(lines), media_type="text/plain")
 
 
+@app.get("/{user_id}/{path:path}")
+async def get_path_root(user_id: str, path: str) -> Response:
+    """
+    Shorthand download siêu ngắn: domain/user_id/filename
+    Chỉ dùng cho tải file hoặc nén thư mục trực tiếp.
+    Được đặt ở cuối cùng để không đè lên các route /api/ hay /dl/
+    """
+    if user_id in ("api", "dl", "get", "favicon.ico"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    user_id, _ = normalize_user_ref(user_id)
+    target = resolve_file_path(user_id, path)
+
+    if target.is_file():
+        return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+    if target.is_dir():
+        folder_name = target.name
+        return _zip_dir(target, folder_name)
+
+    raise HTTPException(status_code=404, detail="Not found")
+
+
 FRONTEND_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1151,6 +1174,13 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         </div>
         <div class="code-row">
           <div class="code-box">
+            <span class="code-label">T\u1ea3i 1 file tr\u1ef1c ti\u1ebfp (si\u00eau ng\u1eafn)</span>
+            <code id="get-file">curl -O &lt;origin&gt;/&lt;user_id&gt;/&lt;folder&gt;/&lt;file&gt;</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('get-file')">Copy</button>
+        </div>
+        <div class="code-row">
+          <div class="code-box">
             <span class="code-label">Upload file/th\u01b0 m\u1ee5c</span>
             <code id="curl-upload">curl -X POST -F "file=@/path/to/file" &lt;origin&gt;/api/upload/newuser=your_alias</code>
           </div>
@@ -1465,11 +1495,13 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const dlPsEl    = document.getElementById("dl-ps");
     const dlShEl    = document.getElementById("dl-sh");
     const dlPsAllEl = document.getElementById("dl-ps-all");
+    const getFileEl = document.getElementById("get-file");
 
     if (uploadEl)  uploadEl.textContent  = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
     if (dlPsEl)    dlPsEl.textContent    = 'curl -s ' + origin + '/dl/ps/' + user + '/<folder> | powershell -';
     if (dlShEl)    dlShEl.textContent    = 'curl -s ' + origin + '/dl/sh/' + user + '/<folder> | bash';
     if (dlPsAllEl) dlPsAllEl.textContent = 'curl -s ' + origin + '/dl/ps/' + user + ' | powershell -';
+    if (getFileEl) getFileEl.textContent = 'curl -O ' + origin + '/' + user + '/<folder>/<file>';
   }
 
 
