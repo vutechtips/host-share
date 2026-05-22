@@ -301,6 +301,30 @@ async def clear_files(user_id: str) -> JSONResponse:
     return JSONResponse({"deleted": deleted})
 
 
+@app.get("/api/download-zip/{user_id}")
+async def download_zip(user_id: str) -> Response:
+    """Nén toàn bộ file của user thành ZIP và trả về để tải xuống."""
+    import io
+    import zipfile as zf
+    user_id, _ = normalize_user_ref(user_id)
+    user_dir = get_user_dir(user_id)
+    if not user_dir.exists():
+        raise HTTPException(status_code=404, detail="No files found")
+    files = [p for p in user_dir.rglob("*") if p.is_file()]
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found")
+    buf = io.BytesIO()
+    with zf.ZipFile(buf, mode="w", compression=zf.ZIP_DEFLATED) as z:
+        for file_path in files:
+            arcname = str(file_path.relative_to(user_dir)).replace("\\", "/")
+            z.write(file_path, arcname)
+    buf.seek(0)
+    return Response(
+        content=buf.read(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="files-{user_id[:8]}.zip"'},
+    )
+
 FRONTEND_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1010,6 +1034,13 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
           </div>
           <button class="secondary small" onclick="copySnippet('curl-download')">Copy</button>
         </div>
+        <div class="code-row">
+          <div class="code-box">
+            <span class="code-label">Tải toàn bộ (ZIP)</span>
+            <code id="curl-zip">curl -OJ &lt;origin&gt;/api/download-zip/&lt;user_id&gt;</code>
+          </div>
+          <button class="secondary small" onclick="copySnippet('curl-zip')">Copy</button>
+        </div>
       </div>
     </div>
 
@@ -1317,9 +1348,11 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const uploadEl = document.getElementById("curl-upload");
     const listEl = document.getElementById("curl-list");
     const dlEl = document.getElementById("curl-download");
+    const zipEl = document.getElementById("curl-zip");
     if (uploadEl) uploadEl.textContent = `curl -X POST -F \"file=@/path/to/file\" ${origin}/api/upload/newuser=${aliasSample}`;
     if (listEl) listEl.textContent = `curl ${origin}/api/files/${user}`;
     if (dlEl) dlEl.textContent = `curl -O ${origin}/api/download/${user}/<filename>`;
+    if (zipEl) zipEl.textContent = `curl -OJ ${origin}/api/download-zip/${user}`;
   }
 
   uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag"); });
