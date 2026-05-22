@@ -1,0 +1,18 @@
+
+services:
+  file-share:
+    build: .
+    container_name: file-share-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Ánh xạ thư mục lưu trữ file ra ngoài host để tránh mất file khi cập nhật container
+      - ./storage:/app/storage
+    environment:
+      - PORT=8000
+      # Số ngày lưu trữ file trước khi tự động xóa (mặc định 7 ngày)
+      - RETENTION_DAYS=7
+      # Tần suất dọn dẹp file cũ (đơn vị giây, mặc định 3600 giây = 1 giờ)
+      - CLEANUP_INTERVAL_SECONDS=3600
+      - STORAGE_ROOT=/app/storage

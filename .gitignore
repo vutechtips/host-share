@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local storage directory
+storage/
+
+# Temporary / test files
+*.txt
+!requirements.txt
+.env
