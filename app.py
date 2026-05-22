@@ -375,6 +375,71 @@ async def get_path(user_id: str, path: str) -> Response:
     raise HTTPException(status_code=404, detail="Not found")
 
 
+def _list_files_in_path(user_id: str, sub_path: str | None, request) -> list[dict]:
+    """Trả về danh sách {name, url} của tất cả file trong user_dir hoặc một thư mục con."""
+    user_dir = get_user_dir(user_id)
+    if not user_dir.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if sub_path:
+        parts = [p for p in sub_path.strip("/").replace("\\", "/").split("/") if p not in ("", ".", "..")]
+        target = (user_dir / "/".join(parts)).resolve()
+        if user_dir not in target.parents and user_dir != target:
+            raise HTTPException(status_code=400, detail="Invalid path")
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="Not found")
+        scan_root = target if target.is_dir() else target.parent
+    else:
+        scan_root = user_dir
+
+    result = []
+    for fp in sorted(scan_root.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = str(fp.relative_to(user_dir)).replace("\\", "/")
+        url = str(request.url_for("download_file", user_id=user_id, filename=rel))
+        # relative path from scan_root
+        local = str(fp.relative_to(scan_root)).replace("\\", "/")
+        result.append({"local": local, "url": url})
+    return result
+
+
+@app.get("/dl/sh/{user_id}", response_class=Response)
+@app.get("/dl/sh/{user_id}/{path:path}", response_class=Response)
+async def dl_bash(user_id: str, request: Request, path: str = "") -> Response:
+    """Trả về bash script tải toàn bộ file, giữ cây thư mục. Dùng: curl -s URL | bash"""
+    user_id, _ = normalize_user_ref(user_id)
+    files = _list_files_in_path(user_id, path or None, request)
+    lines = ["#!/usr/bin/env bash", "set -e"]
+    for f in files:
+        local = f["local"]
+        url = f["url"]
+        parent = "/".join(local.split("/")[:-1])
+        if parent:
+            lines.append(f'mkdir -p "{parent}"')
+        lines.append(f'curl -# -L -o "{local}" "{url}"')
+    lines.append(f'echo "Done: {len(files)} file(s)"')
+    return Response(content="\n".join(lines), media_type="text/plain")
+
+
+@app.get("/dl/ps/{user_id}", response_class=Response)
+@app.get("/dl/ps/{user_id}/{path:path}", response_class=Response)
+async def dl_powershell(user_id: str, request: Request, path: str = "") -> Response:
+    """Trả về PowerShell script tải toàn bộ file, giữ cây thư mục. Dùng: curl -s URL | powershell -"""
+    user_id, _ = normalize_user_ref(user_id)
+    files = _list_files_in_path(user_id, path or None, request)
+    lines = ["$ErrorActionPreference = 'Stop'"]
+    for f in files:
+        local = f["local"].replace("/", "\\")
+        url = f["url"]
+        parent = "\\".join(local.split("\\")[:-1])
+        if parent:
+            lines.append(f'New-Item -ItemType Directory -Force -Path "{parent}" | Out-Null')
+        lines.append(f'Invoke-WebRequest "{url}" -OutFile "{local}"')
+    lines.append(f'Write-Host "Done: {len(files)} file(s)"')
+    return Response(content="\r\n".join(lines), media_type="text/plain")
+
+
 FRONTEND_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1062,27 +1127,27 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
         </div>
       </div>
       <div class="card">
-        <div class="label">CLI &mdash; Download</div>
+        <div class="label">CLI &mdash; Download (t\u1ea3i v\u1ec1 gi\u1eef c\u00e2y th\u01b0 m\u1ee5c)</div>
         <div class="code-row">
           <div class="code-box">
-            <span class="code-label">T\u1ea3i to\u00e0n b\u1ed9 (ZIP)</span>
-            <code id="get-all">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;</code>
+            <span class="code-label">Windows CMD / PowerShell</span>
+            <code id="dl-ps">curl -s &lt;origin&gt;/dl/ps/&lt;user_id&gt;/&lt;folder&gt; | powershell -</code>
           </div>
-          <button class="secondary small" onclick="copySnippet('get-all')">Copy</button>
+          <button class="secondary small" onclick="copySnippet('dl-ps')">Copy</button>
         </div>
         <div class="code-row">
           <div class="code-box">
-            <span class="code-label">T\u1ea3i th\u01b0 m\u1ee5c (ZIP)</span>
-            <code id="get-folder">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;/&lt;folder&gt;</code>
+            <span class="code-label">Linux / Mac</span>
+            <code id="dl-sh">curl -s &lt;origin&gt;/dl/sh/&lt;user_id&gt;/&lt;folder&gt; | bash</code>
           </div>
-          <button class="secondary small" onclick="copySnippet('get-folder')">Copy</button>
+          <button class="secondary small" onclick="copySnippet('dl-sh')">Copy</button>
         </div>
         <div class="code-row">
           <div class="code-box">
-            <span class="code-label">T\u1ea3i 1 file</span>
-            <code id="get-file">curl -OJ &lt;origin&gt;/get/&lt;user_id&gt;/&lt;folder&gt;/&lt;file&gt;</code>
+            <span class="code-label">T\u1ea3i to\u00e0n b\u1ed9 (kh\u00f4ng c\u00f3 folder) \u2014 Windows</span>
+            <code id="dl-ps-all">curl -s &lt;origin&gt;/dl/ps/&lt;user_id&gt; | powershell -</code>
           </div>
-          <button class="secondary small" onclick="copySnippet('get-file')">Copy</button>
+          <button class="secondary small" onclick="copySnippet('dl-ps-all')">Copy</button>
         </div>
         <div class="code-row">
           <div class="code-box">
@@ -1396,15 +1461,15 @@ FRONTEND_HTML_V2 = """<!DOCTYPE html>
     const aliasSample = currentUserId || "your_alias";
     const user = currentUserId || "<user_id>";
 
-    const uploadEl   = document.getElementById("curl-upload");
-    const getAllEl   = document.getElementById("get-all");
-    const getFolderEl = document.getElementById("get-folder");
-    const getFileEl  = document.getElementById("get-file");
+    const uploadEl  = document.getElementById("curl-upload");
+    const dlPsEl    = document.getElementById("dl-ps");
+    const dlShEl    = document.getElementById("dl-sh");
+    const dlPsAllEl = document.getElementById("dl-ps-all");
 
-    if (uploadEl)    uploadEl.textContent    = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
-    if (getAllEl)    getAllEl.textContent    = 'curl -OJ ' + origin + '/get/' + user;
-    if (getFolderEl) getFolderEl.textContent = 'curl -OJ ' + origin + '/get/' + user + '/<folder>';
-    if (getFileEl)  getFileEl.textContent   = 'curl -OJ ' + origin + '/get/' + user + '/<folder>/<file>';
+    if (uploadEl)  uploadEl.textContent  = 'curl -X POST -F "file=@/path/to/file" ' + origin + '/api/upload/newuser=' + aliasSample;
+    if (dlPsEl)    dlPsEl.textContent    = 'curl -s ' + origin + '/dl/ps/' + user + '/<folder> | powershell -';
+    if (dlShEl)    dlShEl.textContent    = 'curl -s ' + origin + '/dl/sh/' + user + '/<folder> | bash';
+    if (dlPsAllEl) dlPsAllEl.textContent = 'curl -s ' + origin + '/dl/ps/' + user + ' | powershell -';
   }
 
 
